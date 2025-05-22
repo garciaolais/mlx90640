@@ -1,5 +1,10 @@
 module github.com/garciaolais/mlx90640
 
-go 1.17
+go 1.22.6
 
-require periph.io/x/periph v3.6.8+incompatible // indirect
+toolchain go1.23.9
+
+require (
+	periph.io/x/conn/v3 v3.7.2
+	periph.io/x/host/v3 v3.8.5
+)

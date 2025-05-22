@@ -6,9 +6,9 @@ import (
 	"log"
 	"math"
 
-	"periph.io/x/periph/conn/i2c"
-	"periph.io/x/periph/conn/i2c/i2creg"
-	"periph.io/x/periph/host"
+	"periph.io/x/conn/v3/i2c"
+	"periph.io/x/conn/v3/i2c/i2creg"
+	"periph.io/x/host/v3"
 )
 
 const (
@@ -110,7 +110,7 @@ func New(addr string) *Mlx90640 {
 	mlx90640.ExtractCPParameters()
 	mlx90640.ExtractAlphaParameters()
 	mlx90640.ExtractOffsetParameters()
-	mlx90640.ExtractKtaPixelParameters()
+	mlx90640.ExtractKtaPixelParameters() 
 	mlx90640.ExtractKvPixelParameters()
 	mlx90640.ExtractCILCParameters()
 	mlx90640.ExtractDeviatingPixels()
@@ -153,17 +153,11 @@ func (m *Mlx90640) CalculateTo(emissivity float64, tr float64, result []float64)
 	vdd := m.GetVdd()
 	ta := m.GetTa()
 
-	ta4 := ta + 273.15
-	ta4 = ta4 * ta4
-	ta4 = ta4 * ta4
-	tr4 := tr + 273.15
-	tr4 = tr4 * tr4
-	tr4 = tr4 * tr4
-	taTr := (tr4 - (tr4 - ta4)) / emissivity
+	taTr := m.calculateTaTr(ta, tr, emissivity)
 
 	ktaScale := math.Pow(2, float64(m._ktaScale))
 	kvScale := math.Pow(2, float64(m._kvScale))
-	alphaScale := math.Pow(2, float64(m._alphaScale))
+	alphaScaleValue := math.Pow(2, float64(m._alphaScale)) 
 
 	alphaCorrR := [4]float64{}
 	alphaCorrR[0] = 1 / (1 + m._ksTo[0]*40)
@@ -171,13 +165,90 @@ func (m *Mlx90640) CalculateTo(emissivity float64, tr float64, result []float64)
 	alphaCorrR[2] = (1 + m._ksTo[1]*float64(m._ct[2]))
 	alphaCorrR[3] = alphaCorrR[2] * (1 + m._ksTo[2]*float64(m._ct[3]-m._ct[2]))
 
-	//------------------------- Gain calculation -----------------------------------
-	gain := float64(m._frameData[778])
-	gain = float64(m._gainEE) / gain
+	gain := m.calculateGain()
 
-	//------------------------- To calculation -------------------------------------
 	mode := byte((m._frameData[832] & 0x1000) >> 5)
 
+	irDataCP := m.calculateIrDataCP(gain, ta, vdd, mode)
+
+	for pixelNumber := 0; pixelNumber < 768; pixelNumber++ {
+		m.processPixel(pixelNumber, mode, subPage, ktaScale, kvScale, alphaScaleValue, gain, irDataCP, taTr, emissivity, vdd, ta, alphaCorrR, result)
+	}
+
+	return result
+}
+
+func (m *Mlx90640) processPixel(pixelNumber int, mode byte, subPage uint16, ktaScale, kvScale, alphaScaleValue, gain float64, irDataCP [2]float64, taTr, emissivity, vdd, ta float64, alphaCorrR [4]float64, result []float64) {
+	ilPattern := int8(pixelNumber/32 - (pixelNumber/64)*2)
+	chessPattern := byte(ilPattern ^ int8(pixelNumber-(pixelNumber/2)*2))
+	conversionPattern := float64(((pixelNumber+2)/4 - (pixelNumber+3)/4 + (pixelNumber+1)/4 - pixelNumber/4) * (1 - 2*int(ilPattern)))
+
+	var pattern byte = 0
+	if mode == 0 {
+		pattern = byte(ilPattern)
+	} else {
+		pattern = chessPattern
+	}
+
+	if uint16(pattern) == m._frameData[833] {
+		irData := float64(m._frameData[pixelNumber])
+		if irData > 32767 {
+			irData -= 65536
+		}
+		irData *= gain
+
+		kta := float64(m._kta[pixelNumber]) / ktaScale
+		kv := float64(m._kv[pixelNumber]) / kvScale
+		irData = irData - float64(float64(m._offset[pixelNumber])*(1+kta*(ta-25)))*(1+kv*(vdd-3.3))
+
+		if int(mode) != m._calibrationModeEE {
+			irData = irData + m._ilChessC[2]*(2*float64(ilPattern)-1) - m._ilChessC[1]*conversionPattern
+		}
+
+		irData = irData - m._tgc*irDataCP[subPage]
+		irData = irData / emissivity
+
+		alphaCompensated := float64(SCALEALPHA * alphaScaleValue / float64(m._alpha[pixelNumber])) 
+		alphaCompensated = float64(alphaCompensated * (1 + m._ksTa*(ta-25)))
+
+		sx := alphaCompensated * alphaCompensated * alphaCompensated * (irData + alphaCompensated*taTr)
+		sx = math.Sqrt(math.Sqrt(sx)) * float64(m._ksTo[1])
+
+		to := math.Sqrt(math.Sqrt(float64(irData/(alphaCompensated*(1-m._ksTo[1]*273.15)+sx)+taTr))) - 273.15
+
+		var _range byte = 0
+		if int(to) < m._ct[1] {
+			_range = 0
+		} else if int(to) < m._ct[2] {
+			_range = 1
+		} else if int(to) < m._ct[3] {
+			_range = 2
+		} else {
+			_range = 3
+		}
+
+		to = math.Sqrt(math.Sqrt(float64(irData/(alphaCompensated*alphaCorrR[_range]*(1+m._ksTo[_range]*(to-float64(m._ct[_range]))))+taTr))) - 273.15
+
+		result[pixelNumber] = to
+	}
+}
+
+func (m *Mlx90640) calculateTaTr(ta, tr, emissivity float64) float64 {
+	ta4 := ta + 273.15
+	ta4 = ta4 * ta4
+	ta4 = ta4 * ta4
+	tr4 := tr + 273.15
+	tr4 = tr4 * tr4
+	tr4 = tr4 * tr4
+	return (tr4 - (tr4 - ta4)) / emissivity
+}
+
+func (m *Mlx90640) calculateGain() float64 {
+	gain := float64(m._frameData[778])
+	return float64(m._gainEE) / gain
+}
+
+func (m *Mlx90640) calculateIrDataCP(gain, ta, vdd float64, mode byte) [2]float64 {
 	irDataCP := [2]float64{}
 	irDataCP[0] = float64(m._frameData[776])
 	irDataCP[1] = float64(m._frameData[808])
@@ -185,7 +256,6 @@ func (m *Mlx90640) CalculateTo(emissivity float64, tr float64, result []float64)
 		if irDataCP[i] > 32767 {
 			irDataCP[i] = irDataCP[i] - 65536
 		}
-
 		irDataCP[i] = gain * irDataCP[i]
 	}
 
@@ -195,63 +265,7 @@ func (m *Mlx90640) CalculateTo(emissivity float64, tr float64, result []float64)
 	} else {
 		irDataCP[1] -= (float64(m._cpOffset[1]) + m._ilChessC[0]) * (1 + m._cpKta*(ta-25)) * (1 + m._cpKv*(vdd-3.3))
 	}
-
-	for pixelNumber := 0; pixelNumber < 768; pixelNumber++ {
-		ilPattern := int8(pixelNumber/32 - (pixelNumber/64)*2)
-		chessPattern := byte(ilPattern ^ int8(pixelNumber-(pixelNumber/2)*2))
-		conversionPattern := float64(((pixelNumber+2)/4 - (pixelNumber+3)/4 + (pixelNumber+1)/4 - pixelNumber/4) * (1 - 2*int(ilPattern)))
-
-		var pattern byte = 0
-		if mode == 0 {
-			pattern = byte(ilPattern)
-		} else {
-			pattern = chessPattern
-		}
-
-		if uint16(pattern) == m._frameData[833] {
-			irData := float64(m._frameData[pixelNumber])
-			if irData > 32767 {
-				irData -= 65536
-			}
-			irData *= gain
-
-			kta := float64(m._kta[pixelNumber]) / ktaScale
-			kv := float64(m._kv[pixelNumber]) / kvScale
-			irData = irData - float64(float64(m._offset[pixelNumber])*(1+kta*(ta-25)))*(1+kv*(vdd-3.3))
-
-			if int(mode) != m._calibrationModeEE {
-				irData = irData + m._ilChessC[2]*(2*float64(ilPattern)-1) - m._ilChessC[1]*conversionPattern
-			}
-
-			irData = irData - m._tgc*irDataCP[subPage]
-			irData = irData / emissivity
-
-			alphaCompensated := float64(SCALEALPHA * alphaScale / float64(m._alpha[pixelNumber]))
-			alphaCompensated = float64(alphaCompensated * (1 + m._ksTa*(ta-25)))
-
-			sx := alphaCompensated * alphaCompensated * alphaCompensated * (irData + alphaCompensated*taTr)
-			sx = math.Sqrt(math.Sqrt(sx)) * float64(m._ksTo[1])
-
-			to := math.Sqrt(math.Sqrt(float64(irData/(alphaCompensated*(1-m._ksTo[1]*273.15)+sx)+taTr))) - 273.15
-
-			var _range byte = 0
-			if int(to) < m._ct[1] {
-				_range = 0
-			} else if int(to) < m._ct[2] {
-				_range = 1
-			} else if int(to) < m._ct[3] {
-				_range = 2
-			} else {
-				_range = 3
-			}
-
-			to = math.Sqrt(math.Sqrt(float64(irData/(alphaCompensated*alphaCorrR[_range]*(1+m._ksTo[_range]*(to-float64(m._ct[_range]))))+taTr))) - 273.15
-
-			result[pixelNumber] = to
-		}
-	}
-
-	return result
+	return irDataCP
 }
 
 func (m *Mlx90640) GetFrameData() uint16 {
@@ -464,6 +478,37 @@ func (m *Mlx90640) ExtractAlphaParameters() {
 	alphaScale := byte(((m._eeData[32] & 0xF000) >> 12) + 30)
 	alphaRef := m._eeData[33]
 
+	accRow, accColumn := m.extractAlphaAccRowColumn()
+
+	accRemScale = byte(m._eeData[32] & 0x000F) // This was already declared above
+	accRowScale = byte((m._eeData[32] & 0x0F00) >> 8) // This was already declared above
+	accColumnScale = byte((m._eeData[32] & 0x00F0) >> 4) // This was already declared above
+
+	alphaTemp := m.calculateAlphaTemp(accRemScale, accRowScale, accColumnScale, alphaRef, accRow, accColumn, alphaScale)
+	m.finalizeAlphaParameters(alphaTemp, alphaScale)
+}
+
+func (m *Mlx90640) finalizeAlphaParameters(alphaTemp []float64, initialAlphaScale byte) {
+	temp := alphaTemp[0]
+	for i := 1; i < 768; i++ {
+		if alphaTemp[i] > temp {
+			temp = alphaTemp[i]
+		}
+	}
+	finalAlphaScale := byte(0)
+	for temp < 32767.4 {
+		temp = temp * 2
+		finalAlphaScale = byte(finalAlphaScale + 1)
+	}
+
+	for i := 0; i < 768; i++ {
+		temp = float64(alphaTemp[i] * float64(math.Pow(2, float64(finalAlphaScale))))
+		m._alpha[i] = int(temp + 0.5)
+	}
+	m._alphaScale = finalAlphaScale
+}
+
+func (m *Mlx90640) extractAlphaAccRowColumn() ([]int, []int) {
 	accRow := make([]int, 24)
 	for i := 0; i < 6; i++ {
 		p := i * 4
@@ -493,7 +538,10 @@ func (m *Mlx90640) ExtractAlphaParameters() {
 			accColumn[i] = accColumn[i] - 16
 		}
 	}
+	return accRow, accColumn
+}
 
+func (m *Mlx90640) calculateAlphaTemp(accRemScale, accRowScale, accColumnScale byte, alphaRef uint16, accRow []int, accColumn []int, currentAlphaScale byte) []float64 {
 	alphaTemp := make([]float64, m.pixelCount)
 	for i := 0; i < 24; i++ {
 		for j := 0; j < 32; j++ {
@@ -505,31 +553,12 @@ func (m *Mlx90640) ExtractAlphaParameters() {
 
 			alphaTemp[p] = alphaTemp[p] * float64(int(1)<<accRemScale)
 			alphaTemp[p] = float64(int(alphaRef)+(accRow[i]<<accRowScale)) + float64(accColumn[j]<<accColumnScale) + alphaTemp[p]
-			alphaTemp[p] = float64(alphaTemp[p] / float64(math.Pow(2, float64(alphaScale))))
+			alphaTemp[p] = float64(alphaTemp[p] / float64(math.Pow(2, float64(currentAlphaScale))))
 			alphaTemp[p] = alphaTemp[p] - m._tgc*(m._cpAlpha[0]+m._cpAlpha[1])/2
 			alphaTemp[p] = float64(SCALEALPHA / alphaTemp[p])
 		}
 	}
-
-	temp := alphaTemp[0]
-	for i := 1; i < 768; i++ {
-		if alphaTemp[i] > temp {
-			temp = alphaTemp[i]
-		}
-	}
-
-	alphaScale = 0
-	for temp < 32767.4 {
-		temp = temp * 2
-		alphaScale = byte(alphaScale + 1)
-	}
-
-	for i := 0; i < 768; i++ {
-		temp = float64(alphaTemp[i] * float64(math.Pow(2, float64(alphaScale))))
-		m._alpha[i] = int(temp + 0.5)
-	}
-
-	m._alphaScale = alphaScale
+	return alphaTemp
 }
 
 func (m *Mlx90640) ExtractOffsetParameters() {
@@ -542,6 +571,26 @@ func (m *Mlx90640) ExtractOffsetParameters() {
 		offsetRef = int(int16(offsetRef))
 	}
 
+	occRow, occColumn := m.extractOffsetOccRowColumn()
+	m.calculatePixelOffsets(occRemScale, occRowScale, occColumnScale, offsetRef, occRow, occColumn)
+}
+
+func (m *Mlx90640) calculatePixelOffsets(occRemScale, accRowScale, accColumnScale byte, offsetRef int, occRow [24]int, occColumn [32]int) {
+	for i := 0; i < 24; i++ {
+		for j := 0; j < 32; j++ {
+			p := 32*i + j
+			m._offset[p] = int(m._eeData[64+p]&0xFC00) >> 10
+			if m._offset[p] > 31 {
+				m._offset[p] = m._offset[p] - 64
+			}
+
+			m._offset[p] = m._offset[p] * (1 << occRemScale)
+			m._offset[p] = (int(offsetRef) + (occRow[i] << accRowScale) + (occColumn[j] << accColumnScale) + m._offset[p])
+		}
+	}
+}
+
+func (m *Mlx90640) extractOffsetOccRowColumn() ([24]int, [32]int) {
 	occRow := [24]int{}
 	for i := 0; i < 6; i++ {
 		p := i * 4
@@ -568,20 +617,41 @@ func (m *Mlx90640) ExtractOffsetParameters() {
 
 	for i := 0; i < 32; i++ {
 		if occColumn[i] > 7 {
-			occColumn[i] = occColumn[i] - 16
+			occColumn[i] = occColumn[i] - 16 
 		}
 	}
+	return occRow, occColumn
+}
 
-	for i := 0; i < 24; i++ {
-		for j := 0; j < 32; j++ {
+// _calculateKtaTemp is a helper function for ExtractKtaPixelParameters
+func (m *Mlx90640) _calculateKtaTemp(ktaRC [4]int8, ktaScale1Initial byte, ktaScale2 byte) []float64 {
+	ktaTemp := make([]float64, m.pixelCount)
+	for i := 0; i < 24; i++ { // HEIGHT
+		for j := 0; j < 32; j++ { // WIDTH
 			p := 32*i + j
-			m._offset[p] = int(m._eeData[64+p]&0xFC00) >> 10
-			if m._offset[p] > 31 {
-				m._offset[p] = m._offset[p] - 64
+			split := byte(2*(p/32-(p/64)*2) + p%2)
+			ktaTemp[p] = float64((m._eeData[64+p] & 0x000E) >> 1)
+
+			if ktaTemp[p] > 3 {
+				ktaTemp[p] = ktaTemp[p] - 8
 			}
 
-			m._offset[p] = m._offset[p] * (1 << occRemScale)
-			m._offset[p] = (int(offsetRef) + (occRow[i] << occRowScale) + (occColumn[j] << occColumnScale) + m._offset[p])
+			ktaTemp[p] = ktaTemp[p] * float64((int(1) << ktaScale2))
+			ktaTemp[p] = float64(ktaRC[split]) + float64(ktaTemp[p])
+			ktaTemp[p] = float64(ktaTemp[p] / float64(math.Pow(2, float64(ktaScale1Initial))))
+		}
+	}
+	return ktaTemp
+}
+
+// _finalizeKtaParameters populates the _kta slice.
+func (m *Mlx90640) _finalizeKtaParameters(ktaTemp []float64, finalKtaScale byte) {
+	for i := 0; i < m.pixelCount; i++ { 
+		val := float64((ktaTemp[i] * float64(math.Pow(2, float64(finalKtaScale)))))
+		if val < 0 {
+			m._kta[i] = (byte)(val - 0.5)
+		} else {
+			m._kta[i] = (byte)(val + 0.5)
 		}
 	}
 }
@@ -593,50 +663,28 @@ func (m *Mlx90640) ExtractKtaPixelParameters() {
 	ktaRC[2] = int8(m._eeData[54] & 0x00FF)
 	ktaRC[3] = int8(m._eeData[55] & 0x00FF)
 
-	ktaScale1 := byte(((m._eeData[56] & 0x00F0) >> 4) + 8)
+	ktaScale1Initial := byte(((m._eeData[56] & 0x00F0) >> 4) + 8)
 	ktaScale2 := byte(m._eeData[56] & 0x000F)
 
-	ktaTemp := make([]float64, m.pixelCount)
-	for i := 0; i < 24; i++ {
-		for j := 0; j < 32; j++ {
-			p := 32*i + j
-			split := byte(2*(p/32-(p/64)*2) + p%2)
-			ktaTemp[p] = float64((m._eeData[64+p] & 0x000E) >> 1)
+	ktaTemp := m._calculateKtaTemp(ktaRC, ktaScale1Initial, ktaScale2) 
 
-			if ktaTemp[p] > 3 {
-				ktaTemp[p] = ktaTemp[p] - 8
-			}
-
-			ktaTemp[p] = ktaTemp[p] * float64((int(1) << ktaScale2))
-			ktaTemp[p] = float64(ktaRC[split]) + float64(ktaTemp[p])
-			ktaTemp[p] = float64(ktaTemp[p] / float64(math.Pow(2, float64(ktaScale1))))
+	maxAbs := math.Abs(float64(ktaTemp[0]))
+	for i := 1; i < m.pixelCount; i++ {
+		if math.Abs(float64(ktaTemp[i])) > maxAbs {
+			maxAbs = math.Abs(float64(ktaTemp[i]))
 		}
 	}
 
-	temp := math.Abs(float64(ktaTemp[0]))
-	for i := 1; i < 768; i++ {
-		if math.Abs(float64(ktaTemp[i])) > temp {
-			temp = math.Abs(float64(ktaTemp[i]))
-		}
+	finalKtaScale := byte(0)
+	currentMax := maxAbs
+	for currentMax < 63.4 {
+		currentMax = currentMax * 2
+		finalKtaScale = byte(finalKtaScale + 1)
 	}
-
-	ktaScale1 = 0
-	for temp < 63.4 {
-		temp = temp * 2
-		ktaScale1 = byte(ktaScale1 + 1)
-	}
-
-	for i := 0; i < 768; i++ {
-		temp := float64((ktaTemp[i] * float64(math.Pow(2, float64(ktaScale1)))))
-		if temp < 0 {
-			m._kta[i] = (byte)(temp - 0.5)
-		} else {
-			m._kta[i] = (byte)(temp + 0.5)
-		}
-	}
-
-	m._ktaScale = ktaScale1
+	m._ktaScale = finalKtaScale
+	m._finalizeKtaParameters(ktaTemp, m._ktaScale)
 }
+
 
 func (m *Mlx90640) ExtractKvPixelParameters() {
 	kvRoco := int8((m._eeData[52] & 0xF000) >> 12)
